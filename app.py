@@ -1,62 +1,53 @@
 from flask import Flask, render_template, request
 import pandas as pd
-import requests
-from io import StringIO
 import random
 from datetime import datetime, date
+from pathlib import Path
 
 app = Flask(__name__)
 
-POWERBALL_URL = "https://raw.githubusercontent.com/akshaybapat/powerball/master/powerball.csv"
-MEGAMILLIONS_URL = "https://raw.githubusercontent.com/akshaybapat/megamillions/master/megamillions.csv"
+BASE_DIR = Path(__file__).resolve().parent
+POWERBALL_CSV = BASE_DIR / "powerball.csv"
+MEGAMILLIONS_CSV = BASE_DIR / "megamillions.csv"
 
-# Cache so we don't re-download every request (refresh daily)
 CACHE = {
-    "powerball": {"ts": None, "df": None, "main_freq": None, "special_freq": None},
-    "megamillions": {"ts": None, "df": None, "main_freq": None, "special_freq": None},
+    "powerball": {"ts": None, "main_freq": None, "special_freq": None},
+    "megamillions": {"ts": None, "main_freq": None, "special_freq": None},
 }
 
+# Your CSV layout (NO HEADER):
+# Col A: ignore
+# Col B..J: month, day, year, n1..n5, special
+BASE_COLS = ["IGNORED", "Month", "Day", "Year", "N1", "N2", "N3", "N4", "N5", "Special"]
 
-def load_lottery_data(url: str, years: int) -> pd.DataFrame:
-    """
-    Loads historical lottery data from CSV URL (GitHub raw),
-    filters to last N years based on 'Draw Date'.
-    """
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
 
-    df = pd.read_csv(StringIO(r.text))
+def load_lottery_data(csv_path: Path, years: int) -> pd.DataFrame:
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
 
-    # Datasets use 'Draw Date'
-    if "Draw Date" not in df.columns:
-        raise ValueError(f"Expected 'Draw Date' column, found: {list(df.columns)}")
+    df = pd.read_csv(csv_path, header=None, names=BASE_COLS)
 
-    df["Draw Date"] = pd.to_datetime(df["Draw Date"], errors="coerce")
+    # Build Draw Date from Month/Day/Year
+    df["Draw Date"] = pd.to_datetime(
+        dict(year=df["Year"], month=df["Month"], day=df["Day"]),
+        errors="coerce"
+    )
+
     cutoff_year = datetime.now().year - years
     df = df[df["Draw Date"].dt.year >= cutoff_year].copy()
+
+    # Ensure numeric
+    for c in ["N1", "N2", "N3", "N4", "N5", "Special"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=["N1", "N2", "N3", "N4", "N5", "Special", "Draw Date"])
 
     return df
 
 
-def parse_numbers(df: pd.DataFrame, special_col: str):
-    """
-    Parses main numbers from 'Winning Numbers' column (space-separated)
-    and special ball from special_col.
-    Returns frequency series for main and special numbers.
-    """
-    if "Winning Numbers" not in df.columns:
-        raise ValueError(f"Expected 'Winning Numbers' column, found: {list(df.columns)}")
-    if special_col not in df.columns:
-        raise ValueError(f"Expected '{special_col}' column, found: {list(df.columns)}")
-
-    main_nums = []
-    for row in df["Winning Numbers"].dropna():
-        parts = str(row).strip().split()
-        # expecting 5 numbers
-        for n in parts:
-            main_nums.append(int(n))
-
-    special_nums = df[special_col].dropna().astype(int)
+def build_frequencies(df: pd.DataFrame):
+    main_nums = df[["N1", "N2", "N3", "N4", "N5"]].astype(int).values.flatten()
+    special_nums = df["Special"].astype(int).values
 
     main_freq = pd.Series(main_nums).value_counts()
     special_freq = pd.Series(special_nums).value_counts()
@@ -70,31 +61,29 @@ def weighted_pick(freq_series: pd.Series, k: int):
     return random.choices(nums, weights=weights, k=k)
 
 
-def generate_ticket(*, main_range: int, special_range: int, main_count: int,
-                    weighted: bool, main_freq: pd.Series | None, special_freq: pd.Series | None):
+def generate_ticket(main_range: int, special_range: int, weighted: bool,
+                    main_freq: pd.Series | None, special_freq: pd.Series | None):
     if weighted and main_freq is not None and special_freq is not None:
         picked = set()
-        while len(picked) < main_count:
+        while len(picked) < 5:
             picked.add(weighted_pick(main_freq, 1)[0])
-        main_nums = sorted(picked)
+        main_nums = sorted(int(x) for x in picked)
 
-        special_num = weighted_pick(special_freq, 1)[0]
-        # Ensure special is within official range (safety)
-        if not (1 <= int(special_num) <= special_range):
-            special_num = random.randint(1, special_range)
+        special = int(weighted_pick(special_freq, 1)[0])
+        if not (1 <= special <= special_range):
+            special = random.randint(1, special_range)
     else:
-        main_nums = sorted(random.sample(range(1, main_range + 1), main_count))
-        special_num = random.randint(1, special_range)
+        main_nums = sorted(random.sample(range(1, main_range + 1), 5))
+        special = random.randint(1, special_range)
 
-    return main_nums, int(special_num)
+    return main_nums, special
 
 
-def get_lottery_config(game: str):
+def get_config(game: str):
     if game == "powerball":
         return {
             "name": "Powerball",
-            "url": POWERBALL_URL,
-            "special_col": "Powerball",
+            "csv": POWERBALL_CSV,
             "main_range": 69,
             "special_range": 26,
             "special_label": "Powerball",
@@ -102,8 +91,7 @@ def get_lottery_config(game: str):
     elif game == "megamillions":
         return {
             "name": "Mega Millions",
-            "url": MEGAMILLIONS_URL,
-            "special_col": "Mega Ball",
+            "csv": MEGAMILLIONS_CSV,
             "main_range": 70,
             "special_range": 25,
             "special_label": "Mega Ball",
@@ -116,15 +104,14 @@ def get_cached_freq(game: str, years: int):
     cache = CACHE[game]
     today = date.today()
 
-    if cache["ts"] == today and cache["main_freq"] is not None and cache["special_freq"] is not None:
+    if cache["ts"] == today and cache["main_freq"] is not None:
         return cache["main_freq"], cache["special_freq"]
 
-    cfg = get_lottery_config(game)
-    df = load_lottery_data(cfg["url"], years=years)
-    main_freq, special_freq = parse_numbers(df, cfg["special_col"])
+    cfg = get_config(game)
+    df = load_lottery_data(cfg["csv"], years=years)
+    main_freq, special_freq = build_frequencies(df)
 
     cache["ts"] = today
-    cache["df"] = df
     cache["main_freq"] = main_freq
     cache["special_freq"] = special_freq
     return main_freq, special_freq
@@ -135,7 +122,6 @@ def index():
     results = []
     error = None
 
-    # defaults
     game = "powerball"
     years = 20
     count = 5
@@ -148,11 +134,10 @@ def index():
             count = int(request.form.get("count", "5"))
             mode = request.form.get("mode", "weighted")
 
-            # guardrails
             years = max(1, min(years, 30))
             count = max(1, min(count, 50))
 
-            cfg = get_lottery_config(game)
+            cfg = get_config(game)
             weighted = (mode == "weighted")
 
             main_freq, special_freq = (None, None)
@@ -163,7 +148,6 @@ def index():
                 main_nums, special_num = generate_ticket(
                     main_range=cfg["main_range"],
                     special_range=cfg["special_range"],
-                    main_count=5,
                     weighted=weighted,
                     main_freq=main_freq,
                     special_freq=special_freq,
@@ -180,7 +164,7 @@ def index():
         game=game,
         years=years,
         count=count,
-        mode=mode,
+        mode=mode
     )
 
 
@@ -194,28 +178,26 @@ def api_generate():
     years = max(1, min(years, 30))
     count = max(1, min(count, 50))
 
-    cfg = get_lottery_config(game)
+    cfg = get_config(game)
     weighted = (mode == "weighted")
 
     main_freq, special_freq = (None, None)
     if weighted:
         main_freq, special_freq = get_cached_freq(game, years)
 
-    out = []
+    tickets = []
     for _ in range(count):
         main_nums, special_num = generate_ticket(
             main_range=cfg["main_range"],
             special_range=cfg["special_range"],
-            main_count=5,
             weighted=weighted,
             main_freq=main_freq,
             special_freq=special_freq,
         )
-        out.append({"numbers": main_nums, cfg["special_label"]: special_num})
+        tickets.append({"numbers": main_nums, cfg["special_label"]: special_num})
 
-    return {"game": cfg["name"], "years": years, "mode": mode, "tickets": out}
+    return {"game": cfg["name"], "years": years, "mode": mode, "tickets": tickets}
 
 
 if __name__ == "__main__":
-    # 0.0.0.0 lets LAN devices access it (same Wi-Fi)
     app.run(host="0.0.0.0", port=5000, debug=True)
